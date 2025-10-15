@@ -4,7 +4,7 @@
 
 1. Log in to your Jenkins instance
 2. Click on your username in the top right
-3. Click on "Configure" in the left sidebar
+3. Click on "Security" in the left sidebar
 4. Click on "API Token" section
 5. Click "Add new Token" and give it a name
 
