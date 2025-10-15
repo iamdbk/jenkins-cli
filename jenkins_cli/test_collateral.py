@@ -1456,6 +1456,479 @@ def console(partial_service_name, build_number, tail, lines, follow):
     except Exception as e:
         click.echo(f"Error retrieving console output: {e}")
 
+@cli.command()
+@click.argument('partial_service_name')
+@click.option('--ttl', '-t', type=int, default=5, help='Time to live in hours for scale up (default: 5)')
+@click.option('--quality', '-q', is_flag=True, help='Enable both tests and code quality checks for build')
+@click.option('--branch', '-b', default='dev', help='Branch to build (partial name match, default: dev)')
+@click.option('--skip-scale', is_flag=True, help='Skip the scale up step')
+@click.option('--skip-deploy', is_flag=True, help='Skip the deploy step')
+@click.option('--debug', '-d', is_flag=True, help='Show debug information')
+def ship(partial_service_name, ttl, quality, branch, skip_scale, skip_deploy, debug):
+    """Ship a service: scale up, build, and deploy in one command
+    
+    This command executes the complete shipping pipeline:
+    1. Scale up and Build run in parallel
+    2. Deploy runs only after both complete successfully
+    
+    Example usage:
+    j ship <service-name> -b feature-123 -q
+    j ship <service-name> --skip-scale
+    j ship <service-name> -t 8 -b dev --skip-deploy
+    """
+    server = get_jenkins_client()
+    
+    # Find the best matching service name
+    matched_service = find_matching_service(partial_service_name, AVAILABLE_SERVICES)
+    
+    if not matched_service:
+        click.echo(f"Error: No service found matching '{partial_service_name}'")
+        
+        # Always show suggestions for better user experience
+        suggestions = get_service_suggestions(partial_service_name)
+        if suggestions:
+            click.echo("\nDid you mean one of these?")
+            for i, suggestion in enumerate(suggestions, 1):
+                click.echo(f"  {i}. {suggestion}")
+            click.echo(f"\nUse: j ship <service-name>")
+            click.echo("Tip: You can use partial names like 'xyz' for 'abc-xyz-service'")
+        else:
+            click.echo("No similar services found.")
+        
+        click.echo("\nUse 'j services' to see all available services.")
+        return
+    
+    service_name = matched_service
+    
+    # If the matched service is different from input, inform the user
+    if matched_service != partial_service_name:
+        click.echo(f"Matched '{partial_service_name}' to '{matched_service}'")
+    
+    click.echo("=" * 80)
+    click.echo(f"SHIPPING: {service_name}")
+    click.echo("=" * 80)
+    
+    build_number = None
+    scale_build_number = None
+    scale_job_name = None
+    build_job_name = None
+    
+    try:
+        # ========================================
+        # PHASE 1: START SCALE UP AND BUILD IN PARALLEL
+        # ========================================
+        click.echo("\n[PHASE 1] STARTING SCALE UP AND BUILD IN PARALLEL")
+        click.echo("-" * 80)
+        
+        # ========================================
+        # START SCALE UP JOB
+        # ========================================
+        if not skip_scale:
+            click.echo("\n[Job 1/2] Starting Scale Up...")
+            
+            scale_job_name = "test-collateral-Scale-up"
+            scale_job_path = get_job_path(scale_job_name)
+            
+            if not server.job_exists(scale_job_path):
+                click.echo(f"Warning: Scale job '{scale_job_name}' not found. Skipping scale up.")
+                skip_scale = True  # Mark as skipped if job doesn't exist
+            else:
+                scale_parameters = {
+                    'SERVICES': service_name,
+                    'TIME_TO_LIVE': str(ttl)
+                }
+                
+                if debug:
+                    click.echo(f"Debug: Scale up parameters: {scale_parameters}")
+                
+                scale_queue_id = server.build_job(scale_job_path, parameters=scale_parameters)
+                click.echo(f"✓ Scale up job triggered")
+                click.echo(f"  Queue ID: {scale_queue_id}")
+                click.echo(f"  Time to live: {ttl} hours")
+                
+                # Wait a moment and get the build number
+                time.sleep(3)
+                scale_job_info = server.get_job_info(scale_job_path)
+                if scale_job_info.get('lastBuild'):
+                    scale_build_number = scale_job_info['lastBuild'].get('number')
+                    if scale_build_number:
+                        click.echo(f"  Build #{scale_build_number}")
+        else:
+            click.echo("\n[Job 1/2] Scale Up - SKIPPED")
+        
+        # ========================================
+        # START BUILD JOB
+        # ========================================
+        click.echo("\n[Job 2/2] Starting Build...")
+        
+        # Get jobs from cache or Jenkins API
+        jobs = get_jobs()
+        
+        # Find all build jobs
+        build_jobs = []
+        for job in jobs:
+            if 'build' in job['name'].lower() and not job['name'].lower().endswith('-report'):
+                build_jobs.append(job)
+        
+        if not build_jobs:
+            click.echo("Error: No build jobs found.")
+            return
+            
+        # Use the input job name as-is (no cleaning)
+        search_name = partial_service_name.lower()
+            
+        # Find matching job
+        matching_jobs = []
+        for job in build_jobs:
+            job_name = job['name'].lower()
+                
+            if search_name in job_name:
+                matching_jobs.append(job)
+                
+        if not matching_jobs:
+            click.echo(f"Error: No build job matching '{partial_service_name}' found.")
+            return
+            
+        # If we have multiple matches, find the best one
+        if len(matching_jobs) > 1:
+            exact_matches = []
+            for job in matching_jobs:
+                job_name = job['name'].lower()
+                if job_name == search_name:
+                    exact_matches.append(job)
+                    
+            if exact_matches:
+                matching_jobs = exact_matches
+            else:
+                prefix_matches = []
+                for job in matching_jobs:
+                    job_name = job['name'].lower()
+                    if job_name.startswith(f"test-collateral-{search_name}"):
+                        prefix_matches.append(job)
+                        
+                if prefix_matches:
+                    matching_jobs = prefix_matches
+                else:
+                    start_matches = []
+                    for job in matching_jobs:
+                        job_name = job['name'].lower()
+                        if job_name.startswith(search_name):
+                            start_matches.append(job)
+                            
+                    if start_matches:
+                        matching_jobs = start_matches
+        
+        selected_job = matching_jobs[0]
+        build_job_name = selected_job['name']
+        build_job_path = get_job_path(build_job_name)
+        
+        if debug:
+            click.echo(f"Debug: Selected build job: {build_job_name}")
+        
+        # Extract service name from job name
+        build_service_name = build_job_name
+        matched_services = []
+        for available_service in AVAILABLE_SERVICES:
+            if available_service in build_job_name:
+                matched_services.append(available_service)
+        
+        if matched_services:
+            build_service_name = max(matched_services, key=len)
+        elif build_job_name.startswith('test-collateral-'):
+            build_service_name = build_job_name.replace('test-collateral-', '').replace('-build', '')
+        
+        # Set up build parameters
+        build_parameters = {
+            'SERVICENAME': build_service_name,
+        }
+        
+        if quality:
+            build_parameters['EnableTests'] = 'Yes'
+            build_parameters['EnableCodequality'] = 'Yes'
+        else:
+            build_parameters['EnableTests'] = 'No'
+            build_parameters['EnableCodequality'] = 'No'
+        
+        # Find matching branch and cache it
+        matched_branch = find_matching_branch(branch)
+        add_branch_to_cache(matched_branch)
+        
+        original_branch = matched_branch
+        if not original_branch.startswith('origin/'):
+            prefixed_branch = f"origin/{original_branch}"
+        else:
+            prefixed_branch = original_branch
+            
+        build_parameters['GIT_REVISION'] = prefixed_branch
+        
+        if debug:
+            click.echo(f"Debug: Build parameters: {build_parameters}")
+        
+        # Trigger build
+        try:
+            jenkins_url = os.getenv("JENKINS_URL")
+            jenkins_user = os.getenv("JENKINS_USER")
+            jenkins_token = os.getenv("JENKINS_TOKEN")
+            
+            build_url = f"{jenkins_url}/job/{build_job_path.replace('/', '/job/')}/buildWithParameters"
+            auth = (jenkins_user, jenkins_token)
+            
+            url_params = []
+            for key, value in build_parameters.items():
+                if key == 'GIT_REVISION':
+                    encoded_value = value.replace(' ', '%20')
+                else:
+                    encoded_value = requests.utils.quote(value)
+                url_params.append(f"{key}={encoded_value}")
+            
+            full_url = f"{build_url}?{'&'.join(url_params)}"
+            response = requests.post(full_url, auth=auth)
+            
+            if response.status_code not in [201, 302]:
+                raise Exception(f"Failed to trigger build: {response.status_code} {response.reason}")
+            
+            # Get build number
+            time.sleep(3)
+            build_job_info = server.get_job_info(build_job_path)
+            if build_job_info.get('lastBuild'):
+                last_build_number = build_job_info['lastBuild'].get('number')
+                if last_build_number:
+                    build_number = last_build_number + 1
+            
+            click.echo(f"✓ Build job '{build_job_name}' triggered")
+            if build_number:
+                click.echo(f"  Build #{build_number}")
+            else:
+                click.echo("  Build #pending")
+            click.echo(f"  Branch: {prefixed_branch}")
+            click.echo(f"  Quality: {'Enabled' if quality else 'Disabled'}")
+        
+        except Exception as e:
+            click.echo(f"Error during build trigger: {e}")
+            if debug:
+                import traceback
+                click.echo(traceback.format_exc())
+            return
+        
+        # ========================================
+        # PHASE 2: WAIT FOR BOTH JOBS TO COMPLETE
+        # ========================================
+        click.echo("\n" + "=" * 80)
+        click.echo("[PHASE 2] WAITING FOR SCALE UP AND BUILD TO COMPLETE")
+        click.echo("=" * 80)
+        
+        scale_result = "SKIPPED"
+        build_result = None
+        
+        # Track completion status
+        scale_complete = skip_scale  # If skipped, mark as complete
+        build_complete = False
+        
+        # Poll interval in seconds
+        poll_interval = 5
+        max_wait_time = 3600  # 1 hour max
+        start_time = time.time()
+        
+        while (not scale_complete or not build_complete) and (time.time() - start_time < max_wait_time):
+            # Check scale up status
+            if not scale_complete and scale_build_number and scale_job_name:
+                try:
+                    scale_build_info = server.get_build_info(get_job_path(scale_job_name), scale_build_number)
+                    if not scale_build_info.get('building'):
+                        scale_complete = True
+                        scale_result = scale_build_info.get('result', 'UNKNOWN')
+                        elapsed = int(time.time() - start_time)
+                        click.echo(f"\n✓ Scale up completed with result: {scale_result} (after {elapsed}s)")
+                except Exception as e:
+                    if debug:
+                        click.echo(f"Debug: Error checking scale up status: {e}")
+            
+            # Check build status
+            if not build_complete and build_number and build_job_name:
+                try:
+                    build_build_info = server.get_build_info(get_job_path(build_job_name), build_number)
+                    if not build_build_info.get('building'):
+                        build_complete = True
+                        build_result = build_build_info.get('result', 'UNKNOWN')
+                        elapsed = int(time.time() - start_time)
+                        click.echo(f"\n✓ Build completed with result: {build_result} (after {elapsed}s)")
+                except Exception as e:
+                    if debug:
+                        click.echo(f"Debug: Error checking build status: {e}")
+            
+            # If both are complete, break
+            if scale_complete and build_complete:
+                break
+            
+            # Show progress
+            elapsed = int(time.time() - start_time)
+            status_parts = []
+            if not scale_complete:
+                status_parts.append("Scale up running")
+            if not build_complete:
+                status_parts.append("Build running")
+            
+            click.echo(f"⏳ {', '.join(status_parts)}... (elapsed: {elapsed}s)", nl=False)
+            click.echo('\r', nl=False)  # Carriage return to overwrite line
+            
+            time.sleep(poll_interval)
+        
+        # Clear the progress line
+        click.echo(" " * 80, nl=False)
+        click.echo('\r', nl=False)
+        
+        # Check if timeout occurred
+        if time.time() - start_time >= max_wait_time:
+            click.echo(f"\n⚠ Timeout reached ({max_wait_time}s). Some jobs may still be running.")
+            if not scale_complete:
+                click.echo("  Scale up: Still running")
+            if not build_complete:
+                click.echo("  Build: Still running")
+            click.echo("\nCannot proceed to deploy. Please check job status manually.")
+            return
+        
+        # Check if build failed
+        if build_result != "SUCCESS":
+            click.echo(f"\n✗ Build failed with result: {build_result}")
+            click.echo("Cannot proceed to deploy.")
+            return
+        
+        # Warn if scale up failed but continue
+        if not skip_scale and scale_result != "SUCCESS":
+            click.echo(f"\n⚠ Warning: Scale up completed with result: {scale_result}")
+            click.echo("Continuing to deploy anyway...")
+        
+        if not build_number:
+            click.echo("\n✗ Build number not available. Cannot proceed to deploy.")
+            return
+        
+        # ========================================
+        # PHASE 3: DEPLOY
+        # ========================================
+        if not skip_deploy:
+            click.echo("\n" + "=" * 80)
+            click.echo("[PHASE 3] DEPLOYING")
+            click.echo("=" * 80)
+            
+            deploy_job_name = "test-collateral-Deploy-services"
+            deploy_job_path = get_job_path(deploy_job_name)
+            
+            jenkins_url = os.getenv("JENKINS_URL")
+            
+            if not server.job_exists(deploy_job_path):
+                click.echo(f"Error: Deploy job '{deploy_job_name}' not found.")
+            else:
+                deploy_parameters = {
+                    'SERVICENAME': service_name,
+                    'BUILD_NO': str(build_number)
+                }
+                
+                if debug:
+                    click.echo(f"Debug: Deploy parameters: {deploy_parameters}")
+                
+                deploy_queue_id = server.build_job(deploy_job_path, parameters=deploy_parameters)
+                click.echo(f"✓ Deploy job for '{service_name}' build #{build_number} triggered")
+                click.echo(f"  Queue ID: {deploy_queue_id}")
+                
+                # Wait for deploy to start and get build number
+                click.echo("  Waiting for deploy job to start...")
+                deploy_build_number = None
+                deploy_start_wait = 60  # Wait up to 60 seconds for job to start
+                deploy_start_time = time.time()
+                
+                while time.time() - deploy_start_time < deploy_start_wait:
+                    time.sleep(3)
+                    try:
+                        deploy_job_info = server.get_job_info(deploy_job_path)
+                        if deploy_job_info.get('lastBuild'):
+                            last_deploy_build = deploy_job_info['lastBuild'].get('number')
+                            # Check if this is a new build (triggered after our queue)
+                            if last_deploy_build:
+                                # Verify this build matches our parameters
+                                deploy_build_info = server.get_build_info(deploy_job_path, last_deploy_build)
+                                # Check if build is recent (started in last 2 minutes)
+                                deploy_timestamp = deploy_build_info.get('timestamp', 0)
+                                current_time_ms = time.time() * 1000
+                                if deploy_timestamp and (current_time_ms - deploy_timestamp < 120000):  # 2 minutes
+                                    deploy_build_number = last_deploy_build
+                                    click.echo(f"  Deploy job started: Build #{deploy_build_number}")
+                                    break
+                    except Exception as e:
+                        if debug:
+                            click.echo(f"Debug: Error getting deploy build number: {e}")
+                
+                if not deploy_build_number:
+                    click.echo("  ⚠ Could not determine deploy build number within timeout")
+                    click.echo(f"  Please check deploy job manually at: {jenkins_url}/job/{deploy_job_path.replace('/', '/job/')}")
+                    click.echo("  The deploy job may still be queued or starting...")
+                else:
+                    # Monitor deploy job until completion
+                    click.echo("  Monitoring deploy job...")
+                    
+                    deploy_poll_interval = 10  # Check every 10 seconds
+                    deploy_max_wait = 3600  # 1 hour max for deploy
+                    deploy_wait_start = time.time()
+                    
+                    deploy_result = None
+                    while time.time() - deploy_wait_start < deploy_max_wait:
+                        try:
+                            deploy_build_info = server.get_build_info(deploy_job_path, deploy_build_number)
+                            
+                            if not deploy_build_info.get('building'):
+                                # Deploy completed
+                                deploy_result = deploy_build_info.get('result', 'UNKNOWN')
+                                elapsed_deploy = int(time.time() - deploy_wait_start)
+                                click.echo(f"\n  ✓ Deploy finished with result: {deploy_result} (after {elapsed_deploy}s)")
+                                break
+                            else:
+                                # Still running - show progress
+                                elapsed_deploy = int(time.time() - deploy_wait_start)
+                                click.echo(f"  ⏳ Deploy still running... (elapsed: {elapsed_deploy}s)", nl=False)
+                                click.echo('\r', nl=False)
+                                time.sleep(deploy_poll_interval)
+                        except Exception as e:
+                            if debug:
+                                click.echo(f"\n  Debug: Error checking deploy status: {e}")
+                            time.sleep(deploy_poll_interval)
+                    
+                    # Clear progress line
+                    click.echo(" " * 80, nl=False)
+                    click.echo('\r', nl=False)
+                    
+                    # Check if timeout occurred
+                    if deploy_result is None:
+                        elapsed_deploy = int(time.time() - deploy_wait_start)
+                        click.echo(f"\n  ⚠ Deploy timeout reached ({elapsed_deploy}s). Job may still be running.")
+                        click.echo(f"  Check status with: j status test-collateral-Deploy-services {deploy_build_number}")
+                    elif deploy_result == "SUCCESS":
+                        click.echo(f"  ✓ Deploy completed successfully!")
+                    else:
+                        click.echo(f"  ✗ Deploy failed with result: {deploy_result}")
+                        click.echo(f"  Check logs with: j console test-collateral-Deploy-services {deploy_build_number}")
+        else:
+            click.echo("\n[PHASE 3] DEPLOY - SKIPPED")
+        
+        # ========================================
+        # SHIPPING SUMMARY
+        # ========================================
+        click.echo("\n" + "=" * 80)
+        click.echo("SHIPPING COMPLETED")
+        click.echo("=" * 80)
+        click.echo(f"Service: {service_name}")
+        if not skip_scale:
+            click.echo(f"Scale: {scale_result} (TTL {ttl} hours)")
+        if build_number and build_result:
+            click.echo(f"Build: {build_result} - #{build_number} (branch: {prefixed_branch}, quality: {'enabled' if quality else 'disabled'})")
+        if not skip_deploy:
+            click.echo(f"Deploy: Check status with 'j status test-collateral-Deploy-services'")
+        click.echo("=" * 80)
+    
+    except Exception as e:
+        click.echo(f"\nError during shipping: {e}")
+        if debug:
+            import traceback
+            click.echo(traceback.format_exc())
+
 def main():
     cli()
 
